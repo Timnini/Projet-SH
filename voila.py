@@ -141,8 +141,8 @@ def lire_cao(chemin):
 
 def verifier_maillage(mesh):
     """Signale les défauts du maillage qui pourraient fausser la suite. Ne bloque pas, avertit.
-    E.2.7 critère 2 : sera appelée à l'étape 2 sur CHAQUE shaped hole, pour signaler
-    le défaut avec l'identifiant du trou concerné."""
+    E.2.7 critère 2 : appelée à l'étape 2 sur CHAQUE corps, pour signaler le défaut
+    avec l'identifiant du trou concerné."""
     alertes = []
     # Étanche = chaque arête est partagée par exactement 2 triangles (pas de trou dans la surface).
     # Sans ça, une coupe par un plan donne des contours ouverts.
@@ -158,7 +158,7 @@ def verifier_maillage(mesh):
     return alertes
 
 
-# ======================= ÉTAPE 2 : SÉPARER ET IDENTIFIER LES SHAPED HOLES (E.2, E.2.1, E.2.6, E.2.7) =======================
+# ======================= ÉTAPE 2 : SÉPARER ET IDENTIFIER LES SHAPED HOLES (E.2, E.2.1, E.2.5, E.2.6, E.2.7) =======================
 #
 # Le fichier contient les CONTRE-FORMES des trous : chaque shaped hole (partie évasée + perçage)
 # est un volume fermé, qui ne touche pas les autres.
@@ -183,12 +183,17 @@ PLANEITE_MIN = 0.8            # 1 = parfaitement plane ; une paroi qui "tourne" 
                               # 0,8 laisse passer une face d'entrée légèrement bombée
 
 # --- Détection du perçage (RANSAC) ---
+# À REVOIR : seuils réglés sur un seul fichier ("2 shaped holes.stl"). Point prévu pour fiabiliser
+# le RANSAC (seuils liés à la finesse du maillage, campagne de tests sur plusieurs fichiers).
 RANSAC_ESSAIS = 300           # nombre de tirages (300 suffit largement : testé sur 20 graines différentes)
 RANSAC_GRAINE = 0             # graine FIXE du hasard -> même résultat à chaque exécution (reproductible)
 TOL_RAYON = 0.01              # un sommet est "sur le cylindre" s'il est à moins de 1 % du rayon (et au moins 1 µm)
 TOL_NORMALE = 0.05            # |normale . axe| < 0,05 : la normale est perpendiculaire à l'axe (à ~3° près)
+TOL_RAYON_LARGE = 0.05        # 1er tri, plus large (5 % du rayon, ~6°) : le cylindre proposé à partir de
+TOL_NORMALE_LARGE = 0.1       # 2 triangles est imprécis, il est réajusté avant le tri fin (LO-RANSAC)
 TROU_ANGULAIRE_MAX_DEG = 45.0 # un perçage fait le TOUR COMPLET de l'axe : aucun "trou" de plus de 45°
                               # dans la répartition des normales autour de l'axe
+BORD_FACE_SORTIE = 0.9        # face plane bordée à 90 % ou plus par le perçage = sa face de sortie
 
 
 def separer_corps(mesh):
@@ -236,8 +241,8 @@ def faces_planes(corps, surface, garder=None):
     somme_normales = np.stack([np.bincount(surface, weights=aires_tri * corps.face_normals[:, k],
                                            minlength=nb) for k in range(3)], axis=1)
     planeite = np.linalg.norm(somme_normales, axis=1) / np.maximum(aire, 1e-300)
-    return [s for s in range(nb) if aire[s] > 0 and aire[s] >= AIRE_MIN_FACE * aire.sum()
-            and planeite[s] >= PLANEITE_MIN]
+    # (une surface entièrement ignorée a une planéité de 0 : elle est exclue d'office)
+    return [s for s in range(nb) if aire[s] >= AIRE_MIN_FACE * aire.sum() and planeite[s] >= PLANEITE_MIN]
 
 
 # ----------------------------- Détection du perçage (partie cylindrique) -----------------------------
@@ -266,13 +271,6 @@ def base_plan(a):
     return u, np.cross(a, u)
 
 
-def ecart_au_cylindre(corps, axe, point, rayon):
-    """Pour chaque triangle : (écart max de ses 3 sommets au cylindre, |normale . axe|)."""
-    P = corps.triangles - point                               # (nb_triangles, 3 sommets, 3 coordonnées)
-    dist_axe = np.linalg.norm(P - (P @ axe)[..., None] * axe, axis=2)
-    return np.abs(dist_axe - rayon).max(axis=1), np.abs(corps.face_normals @ axe)
-
-
 def ajuster_cylindre(corps, sel):
     """Cylindre qui passe au mieux par les triangles sélectionnés (moindres carrés)."""
     N, A = corps.face_normals[sel], corps.area_faces[sel]
@@ -288,7 +286,12 @@ def ajuster_cylindre(corps, sel):
 
 
 def sur_le_cylindre(corps, axe, point, rayon, tol_rayon=TOL_RAYON, tol_normale=TOL_NORMALE):
-    ecart, cos_axe = ecart_au_cylindre(corps, axe, point, rayon)
+    """Masque des triangles posés sur le cylindre : leurs 3 sommets sont à la bonne distance de l'axe
+    (à tol_rayon x rayon près, et au moins 1 µm) ET leur normale est perpendiculaire à l'axe."""
+    P = corps.triangles - point                               # (nb_triangles, 3 sommets, 3 coordonnées)
+    dist_axe = np.linalg.norm(P - (P @ axe)[..., None] * axe, axis=2)
+    ecart = np.abs(dist_axe - rayon).max(axis=1)              # pire des 3 sommets
+    cos_axe = np.abs(corps.face_normals @ axe)
     return (ecart < max(tol_rayon * rayon, 1e-3)) & (cos_axe < tol_normale)
 
 
@@ -307,7 +310,8 @@ def detecter_percage(corps, surface):
     rng = np.random.default_rng(RANSAC_GRAINE)
     G, N, A = corps.triangles_center, corps.face_normals, corps.area_faces
     # On ne tire que parmi les triangles des surfaces COURBES (une face plane ne peut pas être un cylindre)
-    candidats = np.flatnonzero(~np.isin(surface, faces_planes(corps, surface)))
+    planes = faces_planes(corps, surface)
+    candidats = np.flatnonzero(~np.isin(surface, planes))
     if len(candidats) < 6:
         return None
 
@@ -332,7 +336,7 @@ def detecter_percage(corps, surface):
             continue
         point = centre2d[0] * u + centre2d[1] * v
         # 1er tri large, puis on réajuste le cylindre sur ces triangles et on re-trie avec la tolérance fine
-        sel = sur_le_cylindre(corps, axe, point, rayon, tol_rayon=0.05, tol_normale=0.1)
+        sel = sur_le_cylindre(corps, axe, point, rayon, TOL_RAYON_LARGE, TOL_NORMALE_LARGE)
         if sel.sum() < 6:
             continue
         axe, point, rayon = ajuster_cylindre(corps, sel)
@@ -359,11 +363,11 @@ def detecter_percage(corps, surface):
     # votre fichier) dont la normale ne veut rien dire, et qui ne sont donc pas reconnus sur le cylindre.
     # La face d'entrée, elle, est bordée à 0 % par le perçage : aucune confusion possible.
     voisins = corps.face_adjacency
-    for s in faces_planes(corps, surface):
+    for s in planes:
         dans_s = surface == s
         bord = voisins[dans_s[voisins[:, 0]] != dans_s[voisins[:, 1]]]   # paires à cheval sur le bord de s
         exterieur = np.where(dans_s[bord[:, 0]], bord[:, 1], bord[:, 0])
-        if len(exterieur) and masque[exterieur].mean() >= 0.9:
+        if len(exterieur) and masque[exterieur].mean() >= BORD_FACE_SORTIE:
             masque |= dans_s
 
     return {"masque": masque, "axe": axe, "point": point, "rayon": rayon}
@@ -391,7 +395,7 @@ def identifier_shaped_holes(mesh):
             entrees = faces_planes(c, surface, garder=evasement)
             if len(entrees) == 1:
                 pass                                                  # cas normal : shaped hole OK
-            elif evasement.sum() == 0 or c.area_faces[evasement].sum() < AIRE_MIN_FACE * c.area:
+            elif c.area_faces[evasement].sum() < AIRE_MIN_FACE * c.area:
                 defauts.append("perçage sans shaped hole (aucune partie évasée)")       # E.2.7 critère 1
             elif not defauts:
                 ignores.append(c)                                     # ex. : plaque percée
@@ -480,9 +484,11 @@ def afficher_3d(trous, ignores):
     # sinon la vue engloberait aussi l'origine (0, 0, 0), souvent loin des trous)
     centre, taille = scene.centroid, scene.scale
     scene.set_camera(angles=(np.radians(55), 0, np.radians(30)), distance=1.6 * taille, center=centre)
-    # Repère pièce en (0, 0, 0) : X rouge, Y vert, Z bleu (E.2.2.1, sera vérifié à l'étape 3).
+    # Repère pièce : POINT ROUGE à l'origine (0, 0, 0), axes X rouge, Y vert, Z bleu (E.2.2.1, vérifié à l'étape 3).
     # Il peut être hors de l'écran : touche Z pour recentrer sur tout, ou molette pour dézoomer.
-    scene.add_geometry(trimesh.creation.axis(origin_size=0.02 * taille, axis_length=0.3 * taille), geom_name="repere")
+    print("   point rouge = origine (0, 0, 0) du repère pièce | axes X rouge, Y vert, Z bleu")
+    scene.add_geometry(trimesh.creation.axis(origin_size=0.04 * taille, origin_color=[255, 0, 0, 255],
+                                             axis_length=0.3 * taille), geom_name="repere")
     scene.show(smooth=False, caption="Shaped holes - aide au prototypage")
 # ############################################################################################################
 # ################################   FIN DE L'AIDE AU PROTOTYPAGE   ##########################################
@@ -493,7 +499,7 @@ def afficher_3d(trous, ignores):
 # Codes de retour (E.1.1 critère 3) :
 #   0 = tout va bien (y compris : aucun shaped hole, E.2.6)
 #   1 = au moins un shaped hole « à vérifier » (E.2.7), les autres sont quand même traités
-#   2 =fichier d'entrée inutilisable (message explicite, aucun fichier de sortie produit)
+#   2 = fichier d'entrée inutilisable (message explicite, aucun fichier de sortie produit)
 #   3 = erreur inattendue (bug du programme) : message, mais pas de plantage brutal
 
 CHEMIN_PAR_DEFAUT = r"C:\Users\duche\OneDrive\Documents\Maxime\ETUDES SUPERIEURES\SUPMECA\Safran\2 shaped holes.stl"
@@ -503,37 +509,37 @@ def main():
     # On peut donner le fichier dans le terminal :  python voila.py "mon fichier.step"
     chemin = sys.argv[1] if len(sys.argv) > 1 else CHEMIN_PAR_DEFAUT
     try:
+        # --- Étape 1 ---
         mesh, fmt, infos = lire_cao(chemin)
+        print(f"Format reconnu : {fmt} ({Path(chemin).name})")
+        for info in infos:
+            print("INFO :", info)
+        print("Triangles :", len(mesh.faces), "| Sommets :", len(mesh.vertices))
+        print("Dimensions (mm) : X = %.4f  Y = %.4f  Z = %.4f" % tuple(mesh.extents))
+        print("Boîte englobante (mm) : min =", mesh.bounds[0].round(4), " max =", mesh.bounds[1].round(4))
+
+        # --- Étape 2 ---
+        trous, ignores, messages = identifier_shaped_holes(mesh)
+        for m in messages:
+            print("INFO :", m)
+        print(f"Shaped holes détectés : {len(trous)}")
+        for t in trous:
+            p = t["percage"]
+            if p is not None:
+                angle = np.degrees(np.arccos(min(1.0, abs(p["axe"][2]))))
+                info = (f"perçage r = {p['rayon']:.4f} mm, axe {np.round(p['axe'], 3)} ({angle:.1f}° / Z), "
+                        f"{int(p['masque'].sum())} triangles retirés")
+            else:
+                info = "pas de perçage"
+            print(f"   {t['nom']} : {len(t['corps'].faces)} triangles, {info} -> "
+                  f"{'À VÉRIFIER' if t['a_verifier'] else 'OK'}")
+
     except ErreurLecture as exc:
         print("ERREUR :", exc)
         return 2
-    except Exception as exc:  # filet de sécurité : un bug ne doit pas faire planter brutalement
+    except Exception as exc:  # filet de sécurité : un bug, à n'importe quelle étape, ne fait pas planter brutalement
         print(f"ERREUR INATTENDUE ({type(exc).__name__}) :", exc)
         return 3
-
-    print(f"Format reconnu : {fmt} ({Path(chemin).name})")
-    for info in infos:
-        print("INFO :", info)
-    dims = mesh.bounds[1] - mesh.bounds[0]
-    print("Triangles :", len(mesh.faces), "| Sommets :", len(mesh.vertices))
-    print("Dimensions (mm) : X = %.4f  Y = %.4f  Z = %.4f" % tuple(dims))
-    print("Boîte englobante (mm) : min =", mesh.bounds[0].round(4), " max =", mesh.bounds[1].round(4))
-
-    # --- Étape 2 ---
-    trous, ignores, messages = identifier_shaped_holes(mesh)
-    for m in messages:
-        print("INFO :", m)
-    print(f"Shaped holes détectés : {len(trous)}")
-    for t in trous:
-        p = t["percage"]
-        if p is not None:
-            angle = np.degrees(np.arccos(min(1.0, abs(p["axe"][2]))))
-            info = (f"perçage r = {p['rayon']:.4f} mm, axe {np.round(p['axe'], 3)} ({angle:.1f}° / Z), "
-                    f"{int(p['masque'].sum())} triangles retirés")
-        else:
-            info = "pas de perçage"
-        print(f"   {t['nom']} : {len(t['corps'].faces)} triangles, {info} -> "
-              f"{'À VÉRIFIER' if t['a_verifier'] else 'OK'}")
 
     if AFFICHER_3D:   # AIDE AU PROTOTYPAGE - À SUPPRIMER
         afficher_3d(trous, ignores)
