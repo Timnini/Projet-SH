@@ -169,14 +169,15 @@ def verifier_maillage(mesh):
 #      dans la même surface si l'angle entre eux est faible. Une arête vive = on change de surface.
 #                                                                                    -> surfaces_lisses
 #   3. On cherche le PERÇAGE = la partie cylindrique (méthode RANSAC, voir plus bas) -> detecter_percage
-#      et on lui rattache sa face de sortie (le "bouchon" plat au bout du cylindre).
+#      et on lui rattache sa face de sortie (le "bouchon" au bout du cylindre, PLAT OU COURBE).
 #   4. On retire le perçage : il reste la partie ÉVASÉE (le shaped hole proprement dit).
-#      Elle doit avoir exactement 1 face plane (ou presque plane) : la face d'entrée -> faces_planes
+#      Sa face d'entrée (PLATE OU COURBE) = celle par où l'axe du perçage ressort    -> trouver_face_entree
 #   5. Selon ce qu'on a trouvé, le corps est classé                                   -> identifier_shaped_holes
 #         perçage + 1 face d'entrée          -> shaped hole OK
 #         perçage sans partie évasée         -> « perçage sans shaped hole », à vérifier (E.2.7)
 #         pas de perçage mais forme de trou  -> « shaped hole sans perçage », à vérifier (E.2.7)
-#         rien de tout ça, maillage sain     -> pas un shaped hole, écarté (ex. : la plaque du STEP)
+#         perçage CREUX (trou dans un solide) -> pas une contre-forme, écarté (ex. : la plaque du STEP)
+#         rien de tout ça, maillage sain     -> pas un shaped hole, écarté
 
 ANGLE_ARETE_VIVE_DEG = 30.0   # au-delà, deux triangles voisins appartiennent à deux surfaces différentes
 AIRE_MIN_FACE = 0.01          # une face plane de moins de 1 % de l'aire étudiée est ignorée (triangle parasite)
@@ -194,7 +195,6 @@ TOL_RAYON_LARGE = 0.05        # 1er tri, plus large (5 % du rayon, ~6°) : le cy
 TOL_NORMALE_LARGE = 0.1       # 2 triangles est imprécis, il est réajusté avant le tri fin (LO-RANSAC)
 TROU_ANGULAIRE_MAX_DEG = 45.0 # un perçage fait le TOUR COMPLET de l'axe : aucun "trou" de plus de 45°
                               # dans la répartition des normales autour de l'axe
-BORD_FACE_SORTIE = 0.9        # face plane bordée à 90 % ou plus par le perçage = sa face de sortie
 
 
 def separer_corps(mesh):
@@ -307,6 +307,7 @@ def fait_le_tour(corps, sel, axe):
 def detecter_percage(corps, surface):
     """Renvoie None si aucun perçage, sinon un dictionnaire :
         masque : True pour les triangles du perçage (paroi cylindrique + face de sortie)
+        paroi  : True pour les triangles de la paroi cylindrique seule
         axe, point, rayon : le cylindre (axe unitaire, un point de l'axe, rayon en mm)"""
     rng = np.random.default_rng(RANSAC_GRAINE)
     G, N, A = corps.triangles_center, corps.face_normals, corps.area_faces
@@ -357,21 +358,70 @@ def detecter_percage(corps, surface):
     paires = corps.face_adjacency[sel[corps.face_adjacency].all(axis=1)]
     groupe = trimesh.graph.connected_component_labels(paires, node_count=len(corps.faces))
     masque = sel & (groupe == np.bincount(groupe[sel]).argmax())
+    paroi = masque.copy()                       # paroi cylindrique seule (sans la face de sortie)
 
-    # Face de sortie = surface plane entourée par le perçage : on la rattache au perçage.
-    # "Entourée" = au moins 90 % des triangles qui la bordent sont dans le perçage, et pas 100 % :
-    # les exports CAO contiennent parfois des triangles "aiguilles" (ex. : 6 µm x 6 µm x 12 µm sur
-    # votre fichier) dont la normale ne veut rien dire, et qui ne sont donc pas reconnus sur le cylindre.
-    # La face d'entrée, elle, est bordée à 0 % par le perçage : aucune confusion possible.
-    voisins = corps.face_adjacency
-    for s in planes:
-        dans_s = surface == s
-        bord = voisins[dans_s[voisins[:, 0]] != dans_s[voisins[:, 1]]]   # paires à cheval sur le bord de s
-        exterieur = np.where(dans_s[bord[:, 0]], bord[:, 1], bord[:, 0])
-        if len(exterieur) and masque[exterieur].mean() >= BORD_FACE_SORTIE:
-            masque |= dans_s
+    # Face de sortie (PLANE OU COURBE) : on la rattache au perçage.
+    # On coupe le corps le long de la paroi : il reste des MORCEAUX (triangles voisins hors paroi).
+    #   - la partie évasée est un morceau PLUS LARGE que le perçage (c'est la définition de l'évasement)
+    #   - la face de sortie est un morceau enfermé par la paroi et qui reste DANS le rayon du perçage
+    # Ce critère ne dépend ni de la planéité ni des angles : une face de sortie courbe qui se raccorde
+    # en douceur au cylindre (arête < 30°, donc même "surface" lisse que la paroi) est bien trouvée.
+    # Il rattache aussi les triangles "aiguilles" des exports CAO (ex. : 6 µm x 6 µm x 12 µm sur
+    # votre fichier) posés sur la paroi mais dont la normale ne veut rien dire.
+    hors = ~paroi
+    paires = corps.face_adjacency[hors[corps.face_adjacency].all(axis=1)]
+    morceau = trimesh.graph.connected_component_labels(paires, node_count=len(corps.faces))
+    P = corps.triangles - point
+    dist_axe = np.linalg.norm(P - (P @ axe)[..., None] * axe, axis=2).max(axis=1)   # sommet le plus éloigné
+    for m in np.unique(morceau[hors]):
+        dans_m = hors & (morceau == m)
+        if dist_axe[dans_m].max() <= rayon + max(TOL_RAYON * rayon, 1e-3):
+            masque |= dans_m
 
-    return {"masque": masque, "axe": axe, "point": point, "rayon": rayon}
+    return {"masque": masque, "paroi": paroi, "axe": axe, "point": point, "rayon": rayon}
+
+
+def croisements_axe(corps, point, axe, garder):
+    """Triangles (parmi le masque 'garder') traversés par la droite (point, axe).
+    Renvoie (numéros des triangles, abscisses s des points de croisement : point + s.axe).
+    Méthode de Möller-Trumbore (2 produits vectoriels par triangle, calculés pour tous à la fois).
+    Marche sur n'importe quelle surface, plane ou courbe : c'est ce qui remplace "intersection avec un plan"."""
+    idx = np.flatnonzero(garder)
+    T = corps.triangles[idx]
+    e1, e2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]
+    h = np.cross(axe, e2)
+    det = np.einsum("ij,ij->i", e1, h)
+    ok = np.abs(det) > 1e-30                    # det = 0 : droite parallèle au triangle
+    f = np.divide(1.0, det, out=np.zeros_like(det), where=ok)
+    d0 = point - T[:, 0]
+    u = f * np.einsum("ij,ij->i", d0, h)
+    q = np.cross(d0, e1)
+    v = f * (q @ axe)
+    s = f * np.einsum("ij,ij->i", q, e2)
+    tol = 1e-9                                  # un croisement pile sur une arête compte pour les 2 triangles
+    dedans = ok & (u >= -tol) & (v >= -tol) & (u + v <= 1 + tol)
+    return idx[dedans], s[dedans]
+
+
+def percage_creux(corps, percage):
+    """Vrai si la paroi du perçage est CREUSE (normales vers l'axe) : c'est un trou DANS une pièce
+    (ex. : la plaque du STEP), pas une contre-forme. Sur une contre-forme, le perçage est un cylindre
+    plein et ses normales s'éloignent de l'axe (separer_corps a orienté tous les corps vers l'extérieur)."""
+    p = percage["paroi"]
+    r = corps.triangles_center[p] - percage["point"]
+    r -= np.outer(r @ percage["axe"], percage["axe"])                 # composante radiale
+    return (np.einsum("ij,ij->i", corps.face_normals[p], r) * corps.area_faces[p]).sum() < 0
+
+
+def trouver_face_entree(corps, surface, percage):
+    """Face d'entrée = surface par où l'axe du perçage ressort de la partie évasée (plane ou courbe).
+    Si l'axe croise plusieurs fois la partie évasée, c'est le croisement le plus éloigné du perçage
+    (= là où la droite quitte le corps pour la dernière fois). None si l'axe ne ressort pas par l'évasement."""
+    idx, s = croisements_axe(corps, percage["point"], percage["axe"], ~percage["masque"])
+    if len(idx) == 0:
+        return None
+    s_paroi = (corps.triangles_center[percage["paroi"]] - percage["point"]) @ percage["axe"]
+    return int(surface[idx[np.argmax(np.abs(s - s_paroi.mean()))]])
 
 
 def identifier_shaped_holes(mesh):
@@ -391,24 +441,28 @@ def identifier_shaped_holes(mesh):
         percage = detecter_percage(c, surface)
 
         if percage is not None:
-            # On retire le perçage, puis on cherche la face d'entrée dans ce qui reste
-            evasement = ~percage["masque"]
-            entrees = faces_planes(c, surface, garder=evasement)
-            if len(entrees) == 1:
-                pass                                                  # cas normal : shaped hole OK
-            elif c.area_faces[evasement].sum() < AIRE_MIN_FACE * c.area:
-                defauts.append("perçage sans shaped hole (aucune partie évasée)")       # E.2.7 critère 1
-            elif not defauts:
+            if percage_creux(c, percage):
                 ignores.append(c)                                     # ex. : plaque percée
-                messages.append(f"corps n°{k} ignoré : un cylindre mais {len(entrees)} face(s) plane(s) "
-                                f"hors perçage au lieu de 1, ce n'est pas un shaped hole")
+                messages.append(f"corps n°{k} ignoré : perçage creux, c'est une pièce percée et non une "
+                                f"contre-forme de shaped hole")
                 continue
-            else:
-                defauts.append(f"détection incertaine : {len(entrees)} face(s) d'entrée possible(s) au lieu de 1")
+            # On retire le perçage, puis on cherche la face d'entrée (plane ou courbe) dans ce qui reste
+            evasement = ~percage["masque"]
+            face_entree = trouver_face_entree(c, surface, percage)
+            if c.area_faces[evasement].sum() < AIRE_MIN_FACE * c.area:
+                defauts.append("perçage sans shaped hole (aucune partie évasée)")       # E.2.7 critère 1
+            elif face_entree is None:
+                defauts.append("face d'entrée non trouvée : l'axe du perçage ne ressort pas par la partie évasée")
+            elif percage["paroi"][surface == face_entree].any():
+                # Raccords tous en douceur (arêtes < 30°) : la "surface" trouvée englobe aussi le perçage,
+                # on ne peut pas isoler la face d'entrée avec le découpage en surfaces lisses
+                defauts.append("face d'entrée non isolée : elle se raccorde en douceur au reste du trou")
+                face_entree = None
         else:
             # Pas de perçage trouvé : on regarde si le corps a quand même la forme d'un trou (2 faces planes)
             evasement = np.ones(len(c.faces), bool)
             entrees = faces_planes(c, surface)
+            face_entree = entrees[0] if len(entrees) == 1 else None
             if len(entrees) in (1, 2):
                 defauts.append("shaped hole sans perçage identifié (aucune partie cylindrique complète)")
             elif not defauts:
@@ -427,7 +481,7 @@ def identifier_shaped_holes(mesh):
         for defaut in defauts:
             messages.append(f"{nom} : À VÉRIFIER - {defaut}")
         trous.append({"nom": nom, "corps": c, "surface": surface, "percage": percage, "evasement": evasement,
-                      "face_entree": entrees[0] if len(entrees) == 1 else None, "a_verifier": defauts})
+                      "face_entree": face_entree, "a_verifier": defauts})
 
     # E.2.6 : l'absence de shaped hole n'est PAS une erreur -> liste vide + message d'information
     if not trous:
@@ -438,26 +492,25 @@ def identifier_shaped_holes(mesh):
 # ======================= ÉTAPE 3 (début) : CENTRE DU CERCLE EXTÉRIEUR ET VECTEUR DU PERÇAGE =======================
 #
 # Le cercle extérieur = le bout du perçage (en JAUNE) qui débouche sur la face de sortie.
-# Attention : le perçage est INCLINÉ par rapport à cette face (60° et 45° / Z sur "2 shaped holes.stl").
-# Un cylindre incliné coupé par un plan donne une ELLIPSE, pas un cercle. Son centre est le point où
-# l'AXE du perçage (le trait noir) traverse le plan de la face de sortie : c'est ce qu'on calcule.
+# Attention : le perçage est en général INCLINÉ par rapport à cette face, et la face peut être COURBE.
+# Le bout du perçage n'est donc pas un cercle mais une courbe fermée sur la face de sortie. Son centre
+# est le point où l'AXE du perçage (le trait noir) traverse la face de sortie : c'est ce qu'on calcule.
 #
-#   1. On retrouve la face de sortie : la seule surface PLANE dans le perçage (la paroi cylindrique ne l'est pas)
-#   2. Son plan : normale n = moyenne des normales (pondérée par l'aire), point g = centre de gravité de la face
-#   3. Intersection droite / plan : la droite (point P0, direction a) coupe le plan (g, n) au point
-#          centre = P0 + s.a     avec     s = n.(g - P0) / n.a
-#   4. Contrôle : le centre de gravité d'une ellipse pleine est son centre, donc g doit tomber sur le centre.
-#      Un écart signale une face de sortie incomplète ou un axe mal ajusté -> trou « à vérifier » (E.2.7).
+#   1. Face de sortie = les triangles rattachés au perçage qui ne sont pas sur la paroi cylindrique
+#   2. Croisement droite / triangles (croisements_axe) : exact sur une face plane comme sur une face courbe
+#   3. Contrôle : vue le long de l'axe, la face de sortie recouvre exactement le disque du perçage
+#      (rayon r). Le centre de gravité de cette vue (chaque triangle pesé par son aire VUE LE LONG DE
+#      L'AXE) doit donc tomber sur l'axe. Un écart signale une face de sortie incomplète ou un axe mal
+#      ajusté -> trou « à vérifier » (E.2.7).
 #
-# Pourquoi l'intersection plutôt que g directement ? L'axe est ajusté sur TOUTE la paroi du cylindre
-# (des centaines de triangles), g seulement sur le bouchon (quelques triangles, et faux si le bouchon
-# est entamé). On garde g comme contrôle indépendant : deux méthodes qui tombent d'accord = résultat fiable.
+# Pourquoi le croisement plutôt que le centre de gravité directement ? L'axe est ajusté sur TOUTE la paroi
+# du cylindre (des centaines de triangles), le centre de gravité seulement sur le bouchon (faux si le
+# bouchon est entamé). On le garde comme contrôle indépendant : deux méthodes d'accord = résultat fiable.
 #
 # Sens du vecteur : le RANSAC donne l'axe au signe près (a et -a décrivent le même trait noir).
 # On l'ORIENTE du cercle extérieur VERS la partie évasée, pour que le résultat ne dépende pas du hasard.
 
 ECART_CENTRE_MAX = 0.05       # écart toléré entre les 2 calculs du centre : 5 % du rayon du perçage
-COS_AXE_FACE_MIN = 0.05       # |n.a| < 0,05 : axe presque parallèle à la face de sortie, intersection impossible
 
 
 def centre_et_vecteur_percage(trou):
@@ -469,27 +522,18 @@ def centre_et_vecteur_percage(trou):
     p = trou["percage"]
     if p is None:
         return None
-    c, surface = trou["corps"], trou["surface"]
-
-    # 1. Face de sortie = surface plane parmi les triangles du perçage
-    sorties = faces_planes(c, surface, garder=p["masque"])
-    if len(sorties) != 1:
-        trou["a_verifier"].append(f"centre du perçage non calculé : {len(sorties)} face(s) de sortie au lieu de 1")
-        return None
-    dans = surface == sorties[0]
-
-    # 2. Plan de la face de sortie
-    A = c.area_faces[dans]
-    n = (c.face_normals[dans] * A[:, None]).sum(axis=0)
-    n /= np.linalg.norm(n)
-    g = (c.triangles_center[dans] * A[:, None]).sum(axis=0) / A.sum()
-
-    # 3. Intersection de l'axe avec ce plan
+    c = trou["corps"]
     a, P0 = p["axe"], p["point"]
-    if abs(n @ a) < COS_AXE_FACE_MIN:
-        trou["a_verifier"].append("centre du perçage non calculé : axe presque parallèle à la face de sortie")
+
+    # 1. Face de sortie (plane ou courbe) = triangles rattachés au perçage, hors paroi cylindrique
+    dans = p["masque"] & ~p["paroi"]
+
+    # 2. Point où l'axe traverse la face de sortie
+    idx, s = croisements_axe(c, P0, a, dans)
+    if len(idx) == 0:
+        trou["a_verifier"].append("centre du perçage non calculé : l'axe ne traverse pas de face de sortie")
         return None
-    centre = P0 + (n @ (g - P0)) / (n @ a) * a
+    centre = P0 + np.median(s) * a              # médiane : un croisement pile sur une arête compte 2 fois
 
     # Orientation : le vecteur pointe vers la partie évasée (son centre de gravité est "devant" le centre)
     ev = trou["evasement"]
@@ -498,8 +542,11 @@ def centre_et_vecteur_percage(trou):
         if (g_ev - centre) @ a < 0:
             a = -a
 
-    # 4. Contrôle croisé
-    ecart = float(np.linalg.norm(g - centre))
+    # 3. Contrôle croisé : centre de gravité g de la face de sortie VUE LE LONG DE L'AXE
+    #    (aire projetée = aire x |n.a|), puis distance entre g et l'axe (sans la composante le long de l'axe)
+    A = c.area_faces[dans] * np.abs(c.face_normals[dans] @ a)
+    g = (c.triangles_center[dans] * A[:, None]).sum(axis=0) / A.sum()
+    ecart = float(np.linalg.norm((g - centre) - ((g - centre) @ a) * a))
     if ecart > ECART_CENTRE_MAX * p["rayon"]:
         trou["a_verifier"].append(f"centre du perçage incertain : les 2 calculs diffèrent de {ecart:.4f} mm")
 
@@ -608,7 +655,7 @@ def afficher_3d(trous, ignores):
 #   2 = fichier d'entrée inutilisable (message explicite, aucun fichier de sortie produit)
 #   3 = erreur inattendue (bug du programme) : message, mais pas de plantage brutal
 
-CHEMIN_PAR_DEFAUT = r"C:\Users\duche\OneDrive\Documents\Maxime\ETUDES SUPERIEURES\SUPMECA\Safran\2 shaped holes.stl"
+CHEMIN_PAR_DEFAUT = r"C:\Users\duche\OneDrive\Documents\Maxime\ETUDES SUPERIEURES\SUPMECA\Safran\shaped_hole_V1_contre-formes_v2.stl"
 
 
 def main():
