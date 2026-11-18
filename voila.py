@@ -29,7 +29,8 @@
 #   Étape 2  Séparer chaque corps, trouver le perçage (cylindre) et le        E.2, E.2.1, E.2.5,
 #            retirer, garder la partie évasée et sa face d'entrée             E.2.6, E.2.7              <- FAIT
 #   Étape 3  Repère pièce, point central de l'entrée, vecteur du perçage,     E.2.2, E.2.2.1, E.2.2.2, E.2.3,
-#            section du perçage                                               E.2.3.1, E.2.4, E.2.4.1
+#            section du perçage                                               E.2.3.1, E.2.4, E.2.4.1   <- EN COURS
+#            (centre du cercle extérieur du perçage + vecteur : FAIT)
 #   Étape 4  Découpe en sections perpendiculaires à l'axe                     E.3.2, E.3.2.1, E.3.4, E.3.5
 #   Étape 5  Écriture des DXF R12 + dossier de sortie                         E.3, E.3.1, E.3.2.2, E.3.3
 #   Étape 6  Paliers de descente de la tête laser                             E.8, E.8.1 à E.8.5
@@ -434,6 +435,78 @@ def identifier_shaped_holes(mesh):
     return trous, ignores, messages
 
 
+# ======================= ÉTAPE 3 (début) : CENTRE DU CERCLE EXTÉRIEUR ET VECTEUR DU PERÇAGE =======================
+#
+# Le cercle extérieur = le bout du perçage (en JAUNE) qui débouche sur la face de sortie.
+# Attention : le perçage est INCLINÉ par rapport à cette face (60° et 45° / Z sur "2 shaped holes.stl").
+# Un cylindre incliné coupé par un plan donne une ELLIPSE, pas un cercle. Son centre est le point où
+# l'AXE du perçage (le trait noir) traverse le plan de la face de sortie : c'est ce qu'on calcule.
+#
+#   1. On retrouve la face de sortie : la seule surface PLANE dans le perçage (la paroi cylindrique ne l'est pas)
+#   2. Son plan : normale n = moyenne des normales (pondérée par l'aire), point g = centre de gravité de la face
+#   3. Intersection droite / plan : la droite (point P0, direction a) coupe le plan (g, n) au point
+#          centre = P0 + s.a     avec     s = n.(g - P0) / n.a
+#   4. Contrôle : le centre de gravité d'une ellipse pleine est son centre, donc g doit tomber sur le centre.
+#      Un écart signale une face de sortie incomplète ou un axe mal ajusté -> trou « à vérifier » (E.2.7).
+#
+# Pourquoi l'intersection plutôt que g directement ? L'axe est ajusté sur TOUTE la paroi du cylindre
+# (des centaines de triangles), g seulement sur le bouchon (quelques triangles, et faux si le bouchon
+# est entamé). On garde g comme contrôle indépendant : deux méthodes qui tombent d'accord = résultat fiable.
+#
+# Sens du vecteur : le RANSAC donne l'axe au signe près (a et -a décrivent le même trait noir).
+# On l'ORIENTE du cercle extérieur VERS la partie évasée, pour que le résultat ne dépende pas du hasard.
+
+ECART_CENTRE_MAX = 0.05       # écart toléré entre les 2 calculs du centre : 5 % du rayon du perçage
+COS_AXE_FACE_MIN = 0.05       # |n.a| < 0,05 : axe presque parallèle à la face de sortie, intersection impossible
+
+
+def centre_et_vecteur_percage(trou):
+    """Renvoie None si le calcul est impossible (le défaut est alors ajouté à trou["a_verifier"]), sinon :
+        centre  : centre du cercle extérieur (bout jaune du perçage, sur la face de sortie), mm, repère pièce
+        vecteur : vecteur UNITAIRE de l'axe du perçage (trait noir), orienté du centre vers la partie évasée
+        angle_z : angle entre l'axe et Z, en degrés
+        ecart   : distance entre les 2 calculs du centre (contrôle), en mm"""
+    p = trou["percage"]
+    if p is None:
+        return None
+    c, surface = trou["corps"], trou["surface"]
+
+    # 1. Face de sortie = surface plane parmi les triangles du perçage
+    sorties = faces_planes(c, surface, garder=p["masque"])
+    if len(sorties) != 1:
+        trou["a_verifier"].append(f"centre du perçage non calculé : {len(sorties)} face(s) de sortie au lieu de 1")
+        return None
+    dans = surface == sorties[0]
+
+    # 2. Plan de la face de sortie
+    A = c.area_faces[dans]
+    n = (c.face_normals[dans] * A[:, None]).sum(axis=0)
+    n /= np.linalg.norm(n)
+    g = (c.triangles_center[dans] * A[:, None]).sum(axis=0) / A.sum()
+
+    # 3. Intersection de l'axe avec ce plan
+    a, P0 = p["axe"], p["point"]
+    if abs(n @ a) < COS_AXE_FACE_MIN:
+        trou["a_verifier"].append("centre du perçage non calculé : axe presque parallèle à la face de sortie")
+        return None
+    centre = P0 + (n @ (g - P0)) / (n @ a) * a
+
+    # Orientation : le vecteur pointe vers la partie évasée (son centre de gravité est "devant" le centre)
+    ev = trou["evasement"]
+    if ev.any():
+        g_ev = (c.triangles_center[ev] * c.area_faces[ev, None]).sum(axis=0) / c.area_faces[ev].sum()
+        if (g_ev - centre) @ a < 0:
+            a = -a
+
+    # 4. Contrôle croisé
+    ecart = float(np.linalg.norm(g - centre))
+    if ecart > ECART_CENTRE_MAX * p["rayon"]:
+        trou["a_verifier"].append(f"centre du perçage incertain : les 2 calculs diffèrent de {ecart:.4f} mm")
+
+    return {"centre": centre, "vecteur": a, "angle_z": float(np.degrees(np.arccos(min(1.0, abs(a[2]))))),
+            "ecart": ecart}
+
+
 # ############################################################################################################
 # ################   AIDE AU PROTOTYPAGE  —  À SUPPRIMER QUAND LE DÉVELOPPEMENT SERA FINI   ################
 # ############################################################################################################
@@ -447,6 +520,22 @@ PALETTE = [("rouge", [220, 50, 50, 255]), ("bleu", [50, 100, 220, 255]), ("vert"
            ("orange", [240, 140, 20, 255]), ("violet", [150, 60, 200, 255]), ("cyan", [20, 180, 200, 255])]
 GRIS_IGNORES = [150, 150, 150, 70]          # dernier nombre = opacité (0 transparent, 255 opaque)
 JAUNE_PERCAGE = [255, 205, 0, 255]          # même couleur pour tous les perçages (partie à retirer)
+MAGENTA_ETAPE3 = [230, 0, 200, 255]         # centre du cercle extérieur + vecteur du perçage (étape 3)
+
+
+def fleche(depart, direction, longueur, rayon_percage):
+    """Flèche pleine (tige + pointe conique) qui part de 'depart' dans la 'direction' (vecteur unitaire).
+    Les épaisseurs sont proportionnelles au rayon du perçage, pour rester lisibles quelle que soit l'échelle."""
+    r_tige, r_pointe, h_pointe = 0.12 * rayon_percage, 0.35 * rayon_percage, 1.5 * rayon_percage
+    bout_tige = depart + (longueur - h_pointe) * direction
+    tige = trimesh.creation.cylinder(radius=r_tige, segment=[depart, bout_tige], sections=16)
+    # Le cône de trimesh est construit le long de +Z, base à l'origine : on le tourne vers 'direction'
+    pointe = trimesh.creation.cone(radius=r_pointe, height=h_pointe, sections=16)
+    pointe.apply_transform(trimesh.geometry.align_vectors([0, 0, 1], direction))
+    pointe.apply_translation(bout_tige)
+    f = trimesh.util.concatenate([tige, pointe])
+    f.visual.face_colors = MAGENTA_ETAPE3
+    return f
 
 
 def afficher_3d(trous, ignores):
@@ -454,6 +543,9 @@ def afficher_3d(trous, ignores):
     print("Affichage 3D :")
     print("   partie évasée = couleur du trou | face d'entrée = même couleur en clair")
     print("   perçage (partie cylindrique retirée) = JAUNE, axe du perçage = trait noir")
+    print("   centre du cercle extérieur (bout jaune, sur la face de sortie) = boule MAGENTA")
+    print("   vecteur du perçage = flèche MAGENTA, part du centre, pointe vers la partie évasée")
+    print("   (touche W = fil de fer, pour voir la flèche à l'intérieur du trou)")
     print("   corps ignorés = gris transparent")
     for i, t in enumerate(trous):
         nom_couleur, couleur = PALETTE[i % len(PALETTE)]
@@ -472,9 +564,23 @@ def afficher_3d(trous, ignores):
             trait = trimesh.load_path(bouts[None, :, :])
             trait.colors = [[0, 0, 0, 255]]
             scene.add_geometry(trait, geom_name=t["nom"] + "_axe")
+            # Étape 3 : centre du cercle extérieur (boule MAGENTA) + vecteur du perçage (flèche MAGENTA)
+            if t.get("sortie") is not None:
+                centre, vecteur = t["sortie"]["centre"], t["sortie"]["vecteur"]
+                boule = trimesh.creation.icosphere(subdivisions=2, radius=0.3 * p["rayon"])
+                boule.apply_translation(centre)
+                boule.visual.face_colors = MAGENTA_ETAPE3
+                scene.add_geometry(boule, geom_name=t["nom"] + "_centre")
+                # La flèche part du centre et traverse tout le trou : sa pointe sort au-dessus de la face d'entrée
+                longueur = ((c.vertices - centre) @ vecteur).max() + 2 * p["rayon"]
+                scene.add_geometry(fleche(centre, vecteur, longueur, p["rayon"]), geom_name=t["nom"] + "_vecteur")
         c.visual.face_colors = couleurs
         scene.add_geometry(c, geom_name=t["nom"])
         info = f"perçage r = {p['rayon']:.4f} mm" if p is not None else "pas de perçage"
+        if t.get("sortie") is not None:
+            ctr, vec = t["sortie"]["centre"], t["sortie"]["vecteur"]
+            info += (f", centre ({ctr[0]:.4f}, {ctr[1]:.4f}, {ctr[2]:.4f})"
+                     f", vecteur ({vec[0]:.5f}, {vec[1]:.5f}, {vec[2]:.5f})")
         print(f"   {t['nom']} : {nom_couleur} ({info})" + ("  À VÉRIFIER" if t["a_verifier"] else ""))
     for c in ignores:
         g = c.copy()
@@ -533,6 +639,19 @@ def main():
                 info = "pas de perçage"
             print(f"   {t['nom']} : {len(t['corps'].faces)} triangles, {info} -> "
                   f"{'À VÉRIFIER' if t['a_verifier'] else 'OK'}")
+
+        # --- Étape 3 (début) : centre du cercle extérieur + vecteur du perçage ---
+        print("Centre du cercle extérieur et vecteur du perçage (repère pièce, mm) :")
+        for t in trous:
+            nb_defauts = len(t["a_verifier"])
+            t["sortie"] = centre_et_vecteur_percage(t)
+            for defaut in t["a_verifier"][nb_defauts:]:
+                print(f"INFO : {t['nom']} : À VÉRIFIER - {defaut}")
+            s = t["sortie"]
+            if s is not None:
+                print(f"   {t['nom']} : centre = ({s['centre'][0]:.4f}, {s['centre'][1]:.4f}, {s['centre'][2]:.4f})"
+                      f" | vecteur = ({s['vecteur'][0]:.5f}, {s['vecteur'][1]:.5f}, {s['vecteur'][2]:.5f})"
+                      f" | {s['angle_z']:.2f}° / Z | contrôle : écart {s['ecart'] * 1000:.2f} µm")
 
     except ErreurLecture as exc:
         print("ERREUR :", exc)
